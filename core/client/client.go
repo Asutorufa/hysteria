@@ -214,7 +214,7 @@ func (c *clientImpl) TCPContext(ctx context.Context, addr string) (net.Conn, err
 		return nil, wrapIfConnectionClosed(err)
 	}
 	stream := &utils.QStream{Stream: qs}
-	stop := context.AfterFunc(ctx, func() { _ = stream.Close() })
+	stop := context.AfterFunc(ctx, func() { stream.CancelRead(0); stream.CancelWrite(0) })
 	defer stop()
 	if deadline, ok := ctx.Deadline(); ok {
 		_ = stream.SetDeadline(deadline)
