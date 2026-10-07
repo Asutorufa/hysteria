@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"io"
@@ -25,11 +26,16 @@ const (
 )
 
 type Config struct {
-	TLSConfig             TLSConfig
-	QUICConfig            QUICConfig
-	Conn                  net.PacketConn
-	StatelessResetKey     *quic.StatelessResetKey
-	Cleanup               io.Closer
+	TLSConfig         TLSConfig
+	QUICConfig        QUICConfig
+	Conn              net.PacketConn
+	StatelessResetKey *quic.StatelessResetKey
+	Cleanup           io.Closer
+	// StreamHandler delegates authenticated TCP streams to an embedding proxy.
+	// It owns routing, accounting and relay; the protocol response is sent first.
+	StreamHandler func(context.Context, RequestMetadata, HyStream, string)
+	// UDPHandler creates one connection for each authenticated UDP session.
+	UDPHandler            func(context.Context, RequestMetadata, string) (UDPConn, error)
 	RequestHook           RequestHook
 	Outbound              Outbound
 	CongestionConfig      CongestionConfig
@@ -322,4 +328,13 @@ func (s *StreamStats) setHookedReqAddr(addr string) {
 	if addr != s.ReqAddr.Load() {
 		s.HookedReqAddr.Store(addr)
 	}
+}
+
+// RequestMetadata identifies an authenticated connection and, for UDP, a session.
+// SessionID is scoped to the QUIC connection, not globally unique.
+type RequestMetadata struct {
+	Source    net.Addr
+	Inbound   net.Addr
+	AuthID    string
+	SessionID uint32
 }

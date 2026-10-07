@@ -91,16 +91,21 @@ func NewServer(config *Config) (Server, error) {
 		return nil, err
 	}
 	return &serverImpl{
-		config:   config,
-		tr:       tr,
-		listener: listener,
+		config:      config,
+		tr:          tr,
+		listener:    listener,
+		connections: make(map[*quic.Conn]struct{}),
 	}, nil
 }
 
 type serverImpl struct {
-	config   *Config
-	tr       *quic.Transport
-	listener *quic.Listener
+	config      *Config
+	tr          *quic.Transport
+	listener    *quic.Listener
+	mu          sync.Mutex
+	connections map[*quic.Conn]struct{}
+	closed      bool
+	wg          sync.WaitGroup
 }
 
 func (s *serverImpl) Serve() error {
@@ -109,12 +114,32 @@ func (s *serverImpl) Serve() error {
 		if err != nil {
 			return err
 		}
-		go s.handleClient(conn)
+		s.mu.Lock()
+		if s.closed {
+			s.mu.Unlock()
+			_ = conn.CloseWithError(closeErrCodeOK, "")
+			return nil
+		}
+		s.connections[conn] = struct{}{}
+		s.wg.Add(1)
+		s.mu.Unlock()
+		go func() {
+			defer s.wg.Done()
+			defer func() { s.mu.Lock(); delete(s.connections, conn); s.mu.Unlock() }()
+			s.handleClient(conn)
+		}()
 	}
 }
 
 func (s *serverImpl) Close() error {
+	s.mu.Lock()
+	s.closed = true
+	for conn := range s.connections {
+		_ = conn.CloseWithError(closeErrCodeOK, "")
+	}
+	s.mu.Unlock()
 	err := errors.Join(s.listener.Close(), s.tr.Close(), s.config.Conn.Close())
+	s.wg.Wait()
 	if s.config.Cleanup != nil {
 		err = errors.Join(err, s.config.Cleanup.Close())
 	}
@@ -128,6 +153,11 @@ func (s *serverImpl) handleClient(conn *quic.Conn) {
 		StreamDispatcher: handler.ProxyStreamHijacker,
 	}
 	err := h3s.ServeQUICConn(conn)
+	handler.authMutex.Lock()
+	handler.closing = true
+	handler.authMutex.Unlock()
+	_ = conn.CloseWithError(closeErrCodeOK, "")
+	handler.requestWG.Wait()
 	// If the client is authenticated, we need to log the disconnect event
 	if handler.authenticated {
 		if tl := s.config.TrafficLogger; tl != nil {
@@ -146,6 +176,8 @@ type h3sHandler struct {
 
 	authenticated bool
 	authMutex     sync.Mutex
+	closing       bool
+	requestWG     sync.WaitGroup
 	authID        string
 	connID        uint32 // a random id for dump streams
 
@@ -219,7 +251,7 @@ func (h *h3sHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if !h.config.DisableUDP {
 				go func() {
 					sm := newUDPSessionManager(
-						&udpIOImpl{h.conn, id, h.config.TrafficLogger, h.config.RequestHook, h.config.Outbound},
+						&udpIOImpl{h.conn, id, h.config.TrafficLogger, h.config.RequestHook, h.config.Outbound, h.config.UDPHandler},
 						&udpEventLoggerImpl{h.conn, id, h.config.EventLogger},
 						h.config.UDPIdleTimeout,
 					)
@@ -238,7 +270,9 @@ func (h *h3sHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *h3sHandler) ProxyStreamHijacker(ft http3.FrameType, stream *quic.Stream, err error) (bool, error) {
-	if err != nil || !h.authenticated {
+	h.authMutex.Lock()
+	defer h.authMutex.Unlock()
+	if err != nil || !h.authenticated || h.closing {
 		return false, nil
 	}
 
@@ -251,7 +285,8 @@ func (h *h3sHandler) ProxyStreamHijacker(ft http3.FrameType, stream *quic.Stream
 		}
 		// Wraps the stream with QStream, which handles Close() properly
 		qStream := &utils.QStream{Stream: stream}
-		go h.handleTCPRequest(qStream)
+		h.requestWG.Add(1)
+		go func() { defer h.requestWG.Done(); h.handleTCPRequest(qStream) }()
 		return true, nil
 	default:
 		return false, nil
@@ -282,6 +317,16 @@ func (h *h3sHandler) handleTCPRequest(stream *utils.QStream) {
 		return
 	}
 	streamStats.ReqAddr.Store(reqAddr)
+	if handler := h.config.StreamHandler; handler != nil {
+		defer stream.Close()
+		if err := protocol.WriteTCPResponse(stream, true, "Connected"); err != nil {
+			return
+		}
+		handler(h.conn.Context(), RequestMetadata{
+			Source: h.conn.RemoteAddr(), Inbound: h.conn.LocalAddr(), AuthID: h.authID,
+		}, stream, reqAddr)
+		return
+	}
 	// Call the hook if set
 	var putback []byte
 	var hooked bool
@@ -363,6 +408,7 @@ type udpIOImpl struct {
 	TrafficLogger TrafficLogger
 	RequestHook   RequestHook
 	Outbound      Outbound
+	UDPHandler    func(context.Context, RequestMetadata, string) (UDPConn, error)
 }
 
 func (io *udpIOImpl) ReceiveMessage() (*protocol.UDPMessage, error) {
@@ -400,8 +446,8 @@ func (io *udpIOImpl) SendMessage(buf []byte, msg *protocol.UDPMessage) error {
 	}
 	msgN := msg.Serialize(buf)
 	if msgN < 0 {
-		// Message larger than buffer, silent drop
-		return nil
+		// Trigger fragmentation before sending when the serialization buffer is too small.
+		return &quic.DatagramTooLargeError{MaxDatagramPayloadSize: 1024}
 	}
 	return io.Conn.SendDatagram(buf[:msgN])
 }
@@ -438,4 +484,13 @@ func (l *udpEventLoggerImpl) Close(sessionID uint32, err error) {
 	if l.EventLogger != nil {
 		l.EventLogger.UDPError(l.Conn.RemoteAddr(), l.AuthID, sessionID, err)
 	}
+}
+
+func (io *udpIOImpl) UDPForSession(sessionID uint32, reqAddr string) (UDPConn, error) {
+	if handler := io.UDPHandler; handler != nil {
+		return handler(io.Conn.Context(), RequestMetadata{
+			Source: io.Conn.RemoteAddr(), Inbound: io.Conn.LocalAddr(), AuthID: io.AuthID, SessionID: sessionID,
+		}, reqAddr)
+	}
+	return io.UDP(reqAddr)
 }

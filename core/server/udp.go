@@ -211,7 +211,7 @@ func (e *udpSessionEntry) initConn(firstAddr, addr string) error {
 // Exit when either the underlying UDP connection returns error (e.g. closed),
 // or the IO returns error when sending.
 func (e *udpSessionEntry) receiveLoop() {
-	udpBuf := make([]byte, protocol.MaxUDPSize)
+	udpBuf := make([]byte, 65535) // Receive complete UDP packets before fragmenting them.
 	msgBuf := make([]byte, protocol.MaxUDPSize)
 	for {
 		udpN, rAddr, err := e.conn.ReadFrom(udpBuf)
@@ -349,6 +349,11 @@ func (m *udpSessionManager) feed(msg *protocol.UDPMessage) {
 			// Log the event
 			m.eventLogger.New(msg.SessionID, addr)
 			// Dial target
+			if io, ok := m.io.(interface {
+				UDPForSession(uint32, string) (UDPConn, error)
+			}); ok {
+				return io.UDPForSession(msg.SessionID, addr)
+			}
 			return m.io.UDP(addr)
 		}
 		exitFunc := func(err error) {

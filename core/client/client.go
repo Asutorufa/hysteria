@@ -42,14 +42,26 @@ type HandshakeInfo struct {
 	ECHAccepted bool
 }
 
+// ContextClient supports cancellable connection setup and TCP requests.
+// Canceling a setup context after success does not close established connections.
+type ContextClient interface {
+	Client
+	Context() context.Context
+	TCPContext(context.Context, string) (net.Conn, error)
+}
+
 func NewClient(config *Config) (Client, *HandshakeInfo, error) {
+	return NewClientContext(context.Background(), config)
+}
+
+func NewClientContext(ctx context.Context, config *Config) (ContextClient, *HandshakeInfo, error) {
 	if err := config.verifyAndFill(); err != nil {
 		return nil, nil, err
 	}
 	c := &clientImpl{
 		config: config,
 	}
-	info, err := c.connect()
+	info, err := c.connect(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -66,7 +78,7 @@ type clientImpl struct {
 	udpSM *udpSessionManager
 }
 
-func (c *clientImpl) connect() (*HandshakeInfo, error) {
+func (c *clientImpl) connect(ctx context.Context) (*HandshakeInfo, error) {
 	pktConn, err := c.config.ConnFactory.New(c.config.ServerAddr)
 	if err != nil {
 		return nil, err
@@ -129,7 +141,7 @@ func (c *clientImpl) connect() (*HandshakeInfo, error) {
 		Auth: c.config.Auth,
 		Rx:   c.config.BandwidthConfig.MaxRx,
 	})
-	resp, err := rt.RoundTrip(req)
+	resp, err := rt.RoundTrip(req.WithContext(ctx))
 	if err != nil {
 		if conn != nil {
 			_ = conn.CloseWithError(closeErrCodeProtocolError, "")
@@ -190,11 +202,24 @@ func (c *clientImpl) openStream() (*utils.QStream, error) {
 	return &utils.QStream{Stream: stream}, nil
 }
 
+func (c *clientImpl) Context() context.Context { return c.conn.Context() }
+
 func (c *clientImpl) TCP(addr string) (net.Conn, error) {
-	stream, err := c.openStream()
+	return c.TCPContext(context.Background(), addr)
+}
+
+func (c *clientImpl) TCPContext(ctx context.Context, addr string) (net.Conn, error) {
+	qs, err := c.conn.OpenStreamSync(ctx)
 	if err != nil {
 		return nil, wrapIfConnectionClosed(err)
 	}
+	stream := &utils.QStream{Stream: qs}
+	stop := context.AfterFunc(ctx, func() { _ = stream.Close() })
+	defer stop()
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = stream.SetDeadline(deadline)
+	}
+	defer stream.SetDeadline(time.Time{})
 	// Send request
 	err = protocol.WriteTCPRequest(stream, addr)
 	if err != nil {
@@ -334,8 +359,8 @@ func (io *udpIOImpl) ReceiveMessage() (*protocol.UDPMessage, error) {
 func (io *udpIOImpl) SendMessage(buf []byte, msg *protocol.UDPMessage) error {
 	msgN := msg.Serialize(buf)
 	if msgN < 0 {
-		// Message larger than buffer, silent drop
-		return nil
+		// Trigger fragmentation before sending when the serialization buffer is too small.
+		return &quic.DatagramTooLargeError{MaxDatagramPayloadSize: 1024}
 	}
 	return io.Conn.SendDatagram(buf[:msgN])
 }
